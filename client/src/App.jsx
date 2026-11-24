@@ -1,18 +1,122 @@
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   BrainCircuit, FileText, Sparkles, CheckCircle2,
   ListTodo, CalendarDays, Mail, Loader2,
   AlertCircle, ArrowRight, Upload
 } from "lucide-react";
 
-const API = "http://localhost:5001";
+const API = "";
+const SAMPLE_TRANSCRIPT = `Product launch planning — team sync
+
+Maya: We need to launch the new dashboard by March 20. The onboarding flow is still the main blocker.
+Arjun: I will finish the onboarding screens by March 12 and share them for review.
+Leah: I will prepare the launch email and help-center article by March 15.
+Maya: Agreed. We will launch the dashboard on March 20 if QA signs off by March 18.
+Arjun: I will also send the QA checklist by March 14.
+Maya: Let's meet again next week to review progress.`;
 
 export default function App() {
   const [transcript, setTranscript] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [meetings, setMeetings] = useState([]);
+  const [historyError, setHistoryError] = useState("");
+  const [integrations, setIntegrations] = useState({ ai: false, email: false, calendar: false });
+  const [recipient, setRecipient] = useState("");
+  const [calendarStart, setCalendarStart] = useState("");
+  const [calendarEnd, setCalendarEnd] = useState("");
+  const [emailLoading, setEmailLoading] = useState(false);
+  const [calendarLoading, setCalendarLoading] = useState(false);
+  const [automationMessage, setAutomationMessage] = useState("");
+
+  async function loadMeetings() {
+    try {
+      const response = await fetch(`${API}/api/meetings`);
+      const json = await response.json();
+      if (!response.ok) throw new Error(json.error || "Could not load saved meetings.");
+      setMeetings(json.data);
+      setHistoryError("");
+    } catch (err) {
+      setHistoryError(err.message);
+    }
+  }
+
+  useEffect(() => { loadMeetings(); }, []);
+
+  useEffect(() => {
+    fetch(`${API}/api/integrations`)
+      .then(response => response.json())
+      .then(json => { if (json.success) setIntegrations(json.data); })
+      .catch(() => {});
+  }, []);
+
+  async function openMeeting(id) {
+    try {
+      const response = await fetch(`${API}/api/meetings/${id}`);
+      const json = await response.json();
+      if (!response.ok) throw new Error(json.error || "Could not open meeting.");
+      setResult(json.data);
+      setTranscript(json.data.transcript);
+      setError("");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function deleteMeeting(id) {
+    try {
+      const response = await fetch(`${API}/api/meetings/${id}`, { method: "DELETE" });
+      const json = await response.json();
+      if (!response.ok) throw new Error(json.error || "Could not delete meeting.");
+      if (result?.id === id) setResult(null);
+      await loadMeetings();
+    } catch (err) {
+      setHistoryError(err.message);
+    }
+  }
+
+  async function sendRecap() {
+    if (!result?.id) return;
+    setEmailLoading(true);
+    setAutomationMessage("");
+    try {
+      const response = await fetch(`${API}/api/meetings/${result.id}/email`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: recipient }),
+      });
+      const json = await response.json();
+      if (!response.ok || !json.success) throw new Error(json.error || "Could not send recap.");
+      setAutomationMessage(`Recap sent to ${json.data.to}.`);
+    } catch (err) { setAutomationMessage(err.message); }
+    finally { setEmailLoading(false); }
+  }
+
+  async function scheduleFollowUp() {
+    if (!result?.id) return;
+    if (!calendarStart || !calendarEnd) {
+      setAutomationMessage("Select both the follow-up start and end date/time first.");
+      return;
+    }
+    if (calendarEnd <= calendarStart) {
+      setAutomationMessage("The end date/time must be later than the start.");
+      return;
+    }
+    setCalendarLoading(true);
+    setAutomationMessage("");
+    try {
+      const response = await fetch(`${API}/api/meetings/${result.id}/calendar`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ start: calendarStart, end: calendarEnd }),
+      });
+      const json = await response.json();
+      if (!response.ok || !json.success) throw new Error(json.error || "Could not schedule follow-up.");
+      setAutomationMessage("Follow-up added to Google Calendar.");
+      if (json.data.htmlLink) window.open(json.data.htmlLink, "_blank", "noopener,noreferrer");
+    } catch (err) { setAutomationMessage(err.message); }
+    finally { setCalendarLoading(false); }
+  }
 
   async function analyze() {
     if (!transcript.trim()) {
@@ -38,6 +142,7 @@ export default function App() {
       }
 
       setResult(json.data);
+      await loadMeetings();
     } catch (err) {
       setError(err.message || "Analysis failed.");
     } finally {
@@ -117,6 +222,7 @@ export default function App() {
                   className="hidden"
                 />
               </label>
+              <button onClick={() => { setTranscript(SAMPLE_TRANSCRIPT); setResult(null); setError(""); }} className="text-sm text-slate-400 hover:text-white">Load demo transcript</button>
             </div>
 
             <textarea
@@ -153,6 +259,31 @@ export default function App() {
           </section>
 
           <aside className="rounded-2xl border border-white/10 bg-[#111b2e] p-6">
+            <div className="mb-8">
+              <h3 className="mb-3 text-lg font-semibold text-white">Backend Integrations</h3>
+              {[["Gemini AI", integrations.ai], ["Gmail", integrations.email], ["Google Calendar", integrations.calendar]].map(([name, ready]) => (
+                <div key={name} className="flex items-center justify-between border-b border-white/5 py-2 text-sm">
+                  <span className="text-slate-300">{name}</span>
+                  <span className={ready ? "text-emerald-400" : "text-amber-400"}>{ready ? "Configured" : "Setup needed"}</span>
+                </div>
+              ))}
+            </div>
+            <div className="mb-8">
+              <div className="mb-4 flex items-center justify-between">
+                <h3 className="text-lg font-semibold text-white">Saved Meetings</h3>
+                <span className="rounded-full bg-indigo-500/15 px-3 py-1 text-xs text-indigo-300">{meetings.length}</span>
+              </div>
+              {historyError && <p className="mb-3 text-xs text-red-400">{historyError}</p>}
+              {meetings.length ? <div className="max-h-64 space-y-2 overflow-y-auto">
+                {meetings.map((meeting) => <div key={meeting.id} className="flex items-start gap-2 rounded-lg border border-white/10 p-3">
+                  <button onClick={() => openMeeting(meeting.id)} className="min-w-0 flex-1 text-left">
+                    <p className="truncate text-sm font-medium text-white">{meeting.title}</p>
+                    <p className="mt-1 text-xs text-slate-500">{new Date(`${meeting.createdAt.replace(" ", "T")}Z`).toLocaleString()}</p>
+                  </button>
+                  <button onClick={() => deleteMeeting(meeting.id)} aria-label={`Delete ${meeting.title}`} className="px-1 text-xs text-slate-500 hover:text-red-400">Delete</button>
+                </div>)}
+              </div> : <p className="text-sm text-slate-400">Your analyzed meetings will appear here.</p>}
+            </div>
             <h3 className="mb-6 text-lg font-semibold text-white">
               AI Processing Pipeline
             </h3>
@@ -283,27 +414,30 @@ export default function App() {
             </div>
 
             <div className="flex flex-wrap gap-3">
-              <button
-                disabled
-                title="Available after email integration"
-                className="flex cursor-not-allowed items-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 font-medium text-white opacity-50"
-              >
-                <Mail size={18} />
-                Send Email Recap
-              </button>
-              <button
-                disabled
-                title="Available after Calendar integration"
-                className="flex cursor-not-allowed items-center gap-2 rounded-xl border border-white/20 px-5 py-3 font-medium text-white opacity-50"
-              >
-                <CalendarDays size={18} />
-                Schedule Follow-up
-                <ArrowRight size={16} />
-              </button>
+              <div className="flex flex-wrap items-end gap-2 rounded-xl border border-white/10 p-3">
+                <label className="text-xs text-slate-400">Send recap to
+                  <input value={recipient} onChange={e => setRecipient(e.target.value)} type="email" placeholder="name@example.com" className="mt-1 block rounded-lg border border-white/10 bg-[#080d19] px-3 py-2 text-sm text-white outline-none focus:border-indigo-500" />
+                </label>
+                <button onClick={sendRecap} disabled={emailLoading || !result.id} className="flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2 font-medium text-white hover:bg-indigo-500 disabled:opacity-50">
+                  {emailLoading ? <Loader2 size={17} className="animate-spin" /> : <Mail size={17} />}
+                  Send recap
+                </button>
+              </div>
+              <div className="flex flex-wrap items-end gap-2 rounded-xl border border-white/10 p-3">
+                <label className="text-xs text-slate-400">Follow-up starts
+                  <input value={calendarStart} onChange={e => setCalendarStart(e.target.value)} type="datetime-local" className="mt-1 block rounded-lg border border-white/10 bg-[#080d19] px-3 py-2 text-sm text-white outline-none focus:border-indigo-500" />
+                </label>
+                <label className="text-xs text-slate-400">Ends
+                  <input value={calendarEnd} onChange={e => setCalendarEnd(e.target.value)} type="datetime-local" className="mt-1 block rounded-lg border border-white/10 bg-[#080d19] px-3 py-2 text-sm text-white outline-none focus:border-indigo-500" />
+                </label>
+                <button onClick={scheduleFollowUp} disabled={calendarLoading || !result.id} className="flex items-center gap-2 rounded-xl border border-white/20 px-4 py-2 font-medium text-white hover:border-indigo-400 disabled:opacity-50">
+                  {calendarLoading ? <Loader2 size={17} className="animate-spin" /> : <CalendarDays size={17} />}
+                  Schedule
+                  <ArrowRight size={16} />
+                </button>
+              </div>
             </div>
-            <p className="text-xs text-slate-500">
-              Email and Calendar automation will be enabled in the next steps.
-            </p>
+            {automationMessage && <p role="status" className="mt-3 text-sm text-indigo-300">{automationMessage}</p>}
           </div>
         )}
       </main>
