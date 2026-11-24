@@ -1,0 +1,8 @@
+Product launch planning — team sync
+
+Maya: We need to launch the new dashboard by March 20. The onboarding flow is still the main blocker.
+Arjun: I will finish the onboarding screens by March 12 and share them for review.
+Leah: I will prepare the launch email and help-center article by March 15.
+Maya: We will launch on March 20 if QA signs off by March 18.
+Arjun: I will send the QA checklist by March 14.
+Maya: Let's meet again next week to review progress.
