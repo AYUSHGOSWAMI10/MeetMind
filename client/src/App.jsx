@@ -1,12 +1,19 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Menu, X } from "lucide-react";
+import "./App.css";
+import { analyzeTranscript, getIntegrations, getMeeting, listMeetings, removeMeeting } from "./lib/api";
+import { addOwnedId, forgetOwnedId, getOwnedIds, getSessionUser, signOut } from "./lib/auth";
+import { formatDateTime } from "./lib/format";
+import ActionItemsView from "./components/ActionItemsView";
+import AuthScreen from "./components/AuthScreen";
+import HistoryView from "./components/HistoryView";
+import IntegrationsView from "./components/IntegrationsView";
+import MeetingReport from "./components/MeetingReport";
+import ProfileView from "./components/ProfileView";
+import Sidebar from "./components/Sidebar";
+import TranscriptWorkspace, { TRANSCRIPT_LIMIT } from "./components/TranscriptWorkspace";
+import { Alert, BrandMark, Button, PageHeader, Panel, SectionLabel } from "./components/ui";
 
-import { useEffect, useState } from "react";
-import {
-  BrainCircuit, FileText, Sparkles, CheckCircle2,
-  ListTodo, CalendarDays, Mail, Loader2,
-  AlertCircle, ArrowRight, Upload
-} from "lucide-react";
-
-const API = "";
 const SAMPLE_TRANSCRIPT = `Product launch planning — team sync
 
 Maya: We need to launch the new dashboard by March 20. The onboarding flow is still the main blocker.
@@ -16,431 +23,262 @@ Maya: Agreed. We will launch the dashboard on March 20 if QA signs off by March 
 Arjun: I will also send the QA checklist by March 14.
 Maya: Let's meet again next week to review progress.`;
 
-export default function App() {
-  const [transcript, setTranscript] = useState("");
-  const [result, setResult] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [meetings, setMeetings] = useState([]);
-  const [historyError, setHistoryError] = useState("");
-  const [integrations, setIntegrations] = useState({ ai: false, email: false, calendar: false });
-  const [recipient, setRecipient] = useState("");
-  const [calendarStart, setCalendarStart] = useState("");
-  const [calendarEnd, setCalendarEnd] = useState("");
-  const [emailLoading, setEmailLoading] = useState(false);
-  const [calendarLoading, setCalendarLoading] = useState(false);
-  const [automationMessage, setAutomationMessage] = useState("");
+function greeting() {
+  const hour = new Date().getHours();
+  return hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+}
 
-  async function loadMeetings() {
+function Workspace({ user, onUserChange, onLogout }) {
+  const [view, setView] = useState("overview");
+  const [navOpen, setNavOpen] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [sourceName, setSourceName] = useState("");
+  const [result, setResult] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [meetings, setMeetings] = useState([]);
+  const [meetingsLoading, setMeetingsLoading] = useState(true);
+  const [historyError, setHistoryError] = useState("");
+  const [integrations, setIntegrations] = useState({ status: "loading", data: null, error: "" });
+  const [ownedIds, setOwnedIds] = useState(() => getOwnedIds(user.id));
+  const [scope, setScope] = useState("mine");
+  const closeRef = useRef(null);
+
+  const loadMeetings = useCallback(async () => {
     try {
-      const response = await fetch(`${API}/api/meetings`);
-      const json = await response.json();
-      if (!response.ok) throw new Error(json.error || "Could not load saved meetings.");
-      setMeetings(json.data);
+      setMeetings(await listMeetings());
       setHistoryError("");
     } catch (err) {
       setHistoryError(err.message);
+    } finally {
+      setMeetingsLoading(false);
     }
-  }
-
-  useEffect(() => { loadMeetings(); }, []);
-
-  useEffect(() => {
-    fetch(`${API}/api/integrations`)
-      .then(response => response.json())
-      .then(json => { if (json.success) setIntegrations(json.data); })
-      .catch(() => {});
   }, []);
 
-  async function openMeeting(id) {
+  const loadIntegrations = useCallback(async () => {
     try {
-      const response = await fetch(`${API}/api/meetings/${id}`);
-      const json = await response.json();
-      if (!response.ok) throw new Error(json.error || "Could not open meeting.");
-      setResult(json.data);
-      setTranscript(json.data.transcript);
-      setError("");
+      setIntegrations({ status: "ready", data: await getIntegrations(), error: "" });
     } catch (err) {
-      setError(err.message);
+      setIntegrations({ status: "error", data: null, error: err.message });
+    }
+  }, []);
+
+  // Initial state already reads "loading"; these wrappers show it again on user-triggered refreshes.
+  const retryMeetings = useCallback(() => { setMeetingsLoading(true); return loadMeetings(); }, [loadMeetings]);
+  const refreshIntegrations = useCallback(() => { setIntegrations((s) => ({ ...s, status: "loading" })); return loadIntegrations(); }, [loadIntegrations]);
+
+  useEffect(() => {
+    let active = true;
+    listMeetings()
+      .then((data) => active && (setMeetings(data), setHistoryError("")))
+      .catch((err) => active && setHistoryError(err.message))
+      .finally(() => active && setMeetingsLoading(false));
+    getIntegrations()
+      .then((data) => active && setIntegrations({ status: "ready", data, error: "" }))
+      .catch((err) => active && setIntegrations({ status: "error", data: null, error: err.message }));
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!navOpen) return undefined;
+    closeRef.current?.focus();
+    const onKey = (e) => e.key === "Escape" && setNavOpen(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [navOpen]);
+
+  const mine = useMemo(() => meetings.filter((m) => ownedIds.includes(m.id)), [meetings, ownedIds]);
+  const scoped = scope === "mine" ? mine : meetings;
+
+  function navigate(next) {
+    setView(next);
+    setNavOpen(false);
+    setNotice("");
+    window.scrollTo(0, 0);
+  }
+
+  async function openMeeting(id) {
+    setNavOpen(false);
+    try {
+      const data = await getMeeting(id);
+      setResult(data);
+      setTranscript(data.transcript || "");
+      setSourceName("");
+      setError("");
+      setNotice("");
+      setView("report");
+      window.scrollTo(0, 0);
+    } catch (err) {
+      setNotice(err.message);
     }
   }
 
   async function deleteMeeting(id) {
     try {
-      const response = await fetch(`${API}/api/meetings/${id}`, { method: "DELETE" });
-      const json = await response.json();
-      if (!response.ok) throw new Error(json.error || "Could not delete meeting.");
-      if (result?.id === id) setResult(null);
+      await removeMeeting(id);
+      forgetOwnedId(id);
+      setOwnedIds(getOwnedIds(user.id));
+      if (result?.id === id) {
+        setResult(null);
+        if (view === "report") setView("meetings");
+      }
       await loadMeetings();
     } catch (err) {
       setHistoryError(err.message);
     }
   }
 
-  async function sendRecap() {
-    if (!result?.id) return;
-    setEmailLoading(true);
-    setAutomationMessage("");
-    try {
-      const response = await fetch(`${API}/api/meetings/${result.id}/email`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to: recipient }),
-      });
-      const json = await response.json();
-      if (!response.ok || !json.success) throw new Error(json.error || "Could not send recap.");
-      setAutomationMessage(`Recap sent to ${json.data.to}.`);
-    } catch (err) { setAutomationMessage(err.message); }
-    finally { setEmailLoading(false); }
-  }
-
-  async function scheduleFollowUp() {
-    if (!result?.id) return;
-    if (!calendarStart || !calendarEnd) {
-      setAutomationMessage("Select both the follow-up start and end date/time first.");
-      return;
-    }
-    if (calendarEnd <= calendarStart) {
-      setAutomationMessage("The end date/time must be later than the start.");
-      return;
-    }
-    setCalendarLoading(true);
-    setAutomationMessage("");
-    try {
-      const response = await fetch(`${API}/api/meetings/${result.id}/calendar`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ start: calendarStart, end: calendarEnd }),
-      });
-      const json = await response.json();
-      if (!response.ok || !json.success) throw new Error(json.error || "Could not schedule follow-up.");
-      setAutomationMessage("Follow-up added to Google Calendar.");
-      if (json.data.htmlLink) window.open(json.data.htmlLink, "_blank", "noopener,noreferrer");
-    } catch (err) { setAutomationMessage(err.message); }
-    finally { setCalendarLoading(false); }
-  }
-
   async function analyze() {
-    if (!transcript.trim()) {
-      setError("Please enter a meeting transcript.");
-      return;
-    }
-
-    setLoading(true);
+    if (!transcript.trim()) return setError("Please enter a meeting transcript.");
+    if (transcript.length > TRANSCRIPT_LIMIT) return setError(`Transcript is too long (${TRANSCRIPT_LIMIT.toLocaleString()} character limit).`);
+    setAnalyzing(true);
     setError("");
     setResult(null);
-
     try {
-      const response = await fetch(`${API}/api/analyze`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript }),
-      });
-
-      const json = await response.json();
-
-      if (!response.ok || !json.success) {
-        throw new Error(json.details || json.error);
+      const data = await analyzeTranscript(transcript);
+      if (data.id) {
+        addOwnedId(user.id, data.id);
+        setOwnedIds(getOwnedIds(user.id));
       }
-
-      setResult(json.data);
+      setResult(data);
+      setView("report");
+      window.scrollTo(0, 0);
       await loadMeetings();
     } catch (err) {
       setError(err.message || "Analysis failed.");
     } finally {
-      setLoading(false);
+      setAnalyzing(false);
     }
   }
 
   async function uploadFile(e) {
     const file = e.target.files?.[0];
-    if (!file) return;
-
-    if (!/\.(txt|md)$/i.test(file.name)) {
-      setError("Upload a .txt or .md transcript.");
-      return;
-    }
-
-    setTranscript(await file.text());
-    setResult(null);
-    setError("");
     e.target.value = "";
+    if (!file) return;
+    if (!/\.(txt|md)$/i.test(file.name)) return setError("Upload a .txt or .md transcript.");
+    try {
+      const text = await file.text();
+      if (!text.trim()) return setError(`${file.name} is empty.`);
+      setTranscript(text);
+      setSourceName(file.name);
+      setResult(null);
+      setError("");
+    } catch {
+      setError("Could not read that file. Try another one.");
+    }
   }
 
+  function loadDemo() {
+    setTranscript(SAMPLE_TRANSCRIPT);
+    setSourceName("Demo transcript");
+    setResult(null);
+    setError("");
+  }
+
+  const sidebar = (
+    <Sidebar view={view} onNavigate={navigate} user={user} recent={mine.slice(0, 5)} activeMeetingId={result?.id} onOpenMeeting={openMeeting} onLogout={onLogout} />
+  );
+  const listProps = { meetings: scoped, allCount: meetings.length, mineCount: mine.length, scope, onScope: setScope, loading: meetingsLoading, error: historyError };
+
   return (
-    <div className="min-h-screen bg-[#080d19] text-slate-200">
-      <header className="border-b border-white/10 bg-[#0c1425]">
-        <div className="mx-auto max-w-7xl px-6 py-5 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="rounded-xl bg-indigo-600 p-3">
-              <BrainCircuit className="text-white" size={25} />
-            </div>
-            <div>
-              <h1 className="text-2xl font-bold text-white">
-                MeetMind
-              </h1>
-              <p className="text-xs text-slate-400">
-                AI Meeting Intelligence Agent
-              </p>
-            </div>
+    <div className="min-h-screen bg-paper lg:grid lg:grid-cols-[17.5rem_minmax(0,1fr)]">
+      <a href="#main" className="sr-only z-50 rounded bg-ink px-3 py-2 text-paper focus:not-sr-only focus:fixed focus:left-3 focus:top-3">Skip to content</a>
+
+      <aside aria-label="Sidebar" className="sticky top-0 hidden h-screen border-r border-line lg:block">{sidebar}</aside>
+
+      <div className="sticky top-0 z-30 flex items-center justify-between border-b border-line bg-paper/95 px-4 py-3 backdrop-blur lg:hidden">
+        <div className="flex items-center gap-2.5"><BrandMark size={26} /><span className="mm-display text-lg font-semibold">MeetMind</span></div>
+        <button type="button" onClick={() => setNavOpen(true)} aria-label="Open navigation" aria-expanded={navOpen} className="rounded-md p-2 text-ink hover:bg-paper-2"><Menu size={22} aria-hidden="true" /></button>
+      </div>
+
+      {navOpen && (
+        <div className="fixed inset-0 z-40 lg:hidden" role="dialog" aria-modal="true" aria-label="Navigation">
+          <button type="button" aria-label="Close navigation" tabIndex={-1} onClick={() => setNavOpen(false)} className="absolute inset-0 bg-ink/40" />
+          <div className="relative h-full w-72 max-w-[85vw] border-r border-line bg-paper shadow-xl">
+            <button ref={closeRef} type="button" onClick={() => setNavOpen(false)} aria-label="Close navigation" className="absolute right-3 top-4 z-10 rounded-md p-2 text-ink-2 hover:bg-paper-2"><X size={20} aria-hidden="true" /></button>
+            {sidebar}
           </div>
-          <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-4 py-2 text-xs text-emerald-400">
-            ● AI Powered
-          </span>
         </div>
-      </header>
+      )}
 
-      <main className="mx-auto max-w-7xl px-6 py-10">
-        <div className="mb-10">
-          <div className="mb-3 flex items-center gap-2 text-indigo-400">
-            <Sparkles size={17} />
-            <span className="text-sm font-semibold">
-              INTELLIGENT MEETING AUTOMATION
-            </span>
-          </div>
-          <h2 className="text-4xl font-bold text-white">
-            Turn conversations into action.
-          </h2>
-          <p className="mt-3 text-slate-400">
-            Analyze meeting transcripts, extract decisions,
-            assign responsibilities and organize follow-ups.
-          </p>
-        </div>
+      <main id="main" className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-8 lg:px-12 lg:py-12">
+        {notice && <Alert type="error" className="mb-6">{notice}</Alert>}
 
-        <div className="grid gap-6 lg:grid-cols-3">
-          <section className="lg:col-span-2 rounded-2xl border border-white/10 bg-[#111b2e] p-6">
-            <div className="mb-5 flex items-center justify-between">
-              <h3 className="flex items-center gap-2 text-lg font-semibold text-white">
-                <FileText size={21} className="text-indigo-400" />
-                Meeting Transcript
-              </h3>
-              <label className="flex cursor-pointer items-center gap-2 text-sm text-indigo-400 hover:text-indigo-300">
-                <Upload size={16} />
-                Upload File
-                <input
-                  type="file"
-                  accept=".txt,.md"
-                  onChange={uploadFile}
-                  className="hidden"
-                />
-              </label>
-              <button onClick={() => { setTranscript(SAMPLE_TRANSCRIPT); setResult(null); setError(""); }} className="text-sm text-slate-400 hover:text-white">Load demo transcript</button>
-            </div>
-
-            <textarea
-              value={transcript}
-              onChange={(e) => setTranscript(e.target.value)}
-              placeholder="Paste your meeting transcript here..."
-              className="h-72 w-full resize-none rounded-xl border border-white/10 bg-[#080d19] p-5 text-sm leading-7 text-slate-200 outline-none focus:border-indigo-500"
+        {view === "overview" && (
+          <>
+            <PageHeader
+              eyebrow={`${greeting()}, ${user.name.split(" ")[0]}`}
+              title="Turn a transcript into a clear record."
+              description="Paste or upload a meeting transcript. MeetMind extracts the summary, decisions, owners and deadlines — only what the transcript supports."
             />
-
-            <div className="mt-4 flex items-center justify-between">
-              <span className="text-xs text-slate-500">
-                {transcript.length.toLocaleString()} characters
-              </span>
-              <button
-                onClick={analyze}
-                disabled={loading || !transcript.trim()}
-                className="flex items-center gap-2 rounded-xl bg-indigo-600 px-6 py-3 font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {loading ? (
-                  <Loader2 className="animate-spin" size={18} />
-                ) : (
-                  <Sparkles size={18} />
-                )}
-                {loading ? "Analyzing..." : "Analyze Meeting"}
-              </button>
-            </div>
-
-            {error && (
-              <div className="mt-4 flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">
-                <AlertCircle size={18} />
-                {error}
+            <TranscriptWorkspace
+              transcript={transcript}
+              onChange={(value) => { setTranscript(value); setSourceName(""); }}
+              sourceName={sourceName}
+              onUpload={uploadFile}
+              onLoadDemo={loadDemo}
+              onAnalyze={analyze}
+              loading={analyzing}
+              error={error}
+            />
+            <section aria-labelledby="latest-h" className="mt-12">
+              <div className="mb-3 flex items-center justify-between">
+                <SectionLabel><span id="latest-h">Latest meetings</span></SectionLabel>
+                {mine.length > 0 && <button type="button" onClick={() => navigate("meetings")} className="text-sm font-medium text-cobalt hover:underline">View all</button>}
               </div>
-            )}
-          </section>
-
-          <aside className="rounded-2xl border border-white/10 bg-[#111b2e] p-6">
-            <div className="mb-8">
-              <h3 className="mb-3 text-lg font-semibold text-white">Backend Integrations</h3>
-              {[["Gemini AI", integrations.ai], ["Gmail", integrations.email], ["Google Calendar", integrations.calendar]].map(([name, ready]) => (
-                <div key={name} className="flex items-center justify-between border-b border-white/5 py-2 text-sm">
-                  <span className="text-slate-300">{name}</span>
-                  <span className={ready ? "text-emerald-400" : "text-amber-400"}>{ready ? "Configured" : "Setup needed"}</span>
-                </div>
-              ))}
-            </div>
-            <div className="mb-8">
-              <div className="mb-4 flex items-center justify-between">
-                <h3 className="text-lg font-semibold text-white">Saved Meetings</h3>
-                <span className="rounded-full bg-indigo-500/15 px-3 py-1 text-xs text-indigo-300">{meetings.length}</span>
-              </div>
-              {historyError && <p className="mb-3 text-xs text-red-400">{historyError}</p>}
-              {meetings.length ? <div className="max-h-64 space-y-2 overflow-y-auto">
-                {meetings.map((meeting) => <div key={meeting.id} className="flex items-start gap-2 rounded-lg border border-white/10 p-3">
-                  <button onClick={() => openMeeting(meeting.id)} className="min-w-0 flex-1 text-left">
-                    <p className="truncate text-sm font-medium text-white">{meeting.title}</p>
-                    <p className="mt-1 text-xs text-slate-500">{new Date(`${meeting.createdAt.replace(" ", "T")}Z`).toLocaleString()}</p>
-                  </button>
-                  <button onClick={() => deleteMeeting(meeting.id)} aria-label={`Delete ${meeting.title}`} className="px-1 text-xs text-slate-500 hover:text-red-400">Delete</button>
-                </div>)}
-              </div> : <p className="text-sm text-slate-400">Your analyzed meetings will appear here.</p>}
-            </div>
-            <h3 className="mb-6 text-lg font-semibold text-white">
-              AI Processing Pipeline
-            </h3>
-            {[
-              ["1", "Transcript Input", "Upload or paste meeting notes"],
-              ["2", "Gemini Analysis", "Understand meeting context"],
-              ["3", "Decision Extraction", "Identify key decisions"],
-              ["4", "Action Tracking", "Extract owners and deadlines"],
-              ["5", "Automation", "Email and Calendar integration"]
-            ].map(([n, title, desc], i) => (
-              <div key={n} className="flex gap-4">
-                <div className="flex flex-col items-center">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-500/15 text-sm font-bold text-indigo-400">
-                    {n}
-                  </div>
-                  {i < 4 && (
-                    <div className="my-2 h-8 w-px bg-white/10" />
-                  )}
-                </div>
-                <div className="pb-5">
-                  <p className="font-medium text-white">{title}</p>
-                  <p className="mt-1 text-xs text-slate-400">{desc}</p>
-                </div>
-              </div>
-            ))}
-          </aside>
-        </div>
-
-        {result && (
-          <div className="mt-8 space-y-6">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <p className="mb-1 text-sm text-emerald-400">
-                  <CheckCircle2 size={15} className="mr-2 inline" />
-                  Analysis completed
-                </p>
-                <h2 className="text-2xl font-bold text-white">
-                  {result.title}
-                </h2>
-              </div>
-              <span className="rounded-lg bg-indigo-500/10 px-4 py-2 text-sm text-indigo-300">
-                Gemini AI Analysis
-              </span>
-            </div>
-
-            <div className="grid gap-6 md:grid-cols-2">
-              <div className="rounded-2xl border border-white/10 bg-[#111b2e] p-6">
-                <h3 className="mb-4 flex items-center gap-2 text-lg font-semibold text-white">
-                  <FileText className="text-indigo-400" size={20} />
-                  Meeting Summary
-                </h3>
-                <p className="text-sm leading-7 text-slate-300">
-                  {result.summary}
-                </p>
-              </div>
-
-              <div className="rounded-2xl border border-white/10 bg-[#111b2e] p-6">
-                <h3 className="mb-4 flex items-center gap-2 text-lg font-semibold text-white">
-                  <CheckCircle2 className="text-emerald-400" size={20} />
-                  Key Decisions
-                </h3>
-                <div className="space-y-3">
-                  {result.decisions?.length ? (
-                    result.decisions.map((decision, i) => (
-                      <div key={i} className="flex gap-3 text-sm text-slate-300">
-                        <CheckCircle2
-                          size={17}
-                          className="mt-0.5 shrink-0 text-emerald-400"
-                        />
-                        {decision}
-                      </div>
-                    ))
-                  ) : (
-                    <p className="text-sm text-slate-400">
-                      No decisions identified.
-                    </p>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="overflow-hidden rounded-2xl border border-white/10 bg-[#111b2e]">
-              <div className="flex items-center gap-2 border-b border-white/10 p-6">
-                <ListTodo size={21} className="text-indigo-400" />
-                <h3 className="text-lg font-semibold text-white">
-                  Action Items
-                </h3>
-                <span className="ml-auto rounded-full bg-indigo-500/15 px-3 py-1 text-xs text-indigo-300">
-                  {result.actionItems?.length || 0} Tasks
-                </span>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm">
-                  <thead className="bg-white/5 text-slate-400">
-                    <tr>
-                      <th className="px-6 py-4">Task</th>
-                      <th className="px-6 py-4">Owner</th>
-                      <th className="px-6 py-4">Deadline</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {result.actionItems?.map((item, i) => (
-                      <tr key={i} className="border-t border-white/5">
-                        <td className="px-6 py-4 text-white">{item.task}</td>
-                        <td className="px-6 py-4">
-                          <span className="rounded-lg bg-indigo-500/10 px-3 py-1 text-indigo-300">
-                            {item.owner}
-                          </span>
-                        </td>
-                        <td className="px-6 py-4 text-slate-300">
-                          {item.deadline}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-white/10 bg-[#111b2e] p-6">
-              <h3 className="mb-4 flex items-center gap-2 text-lg font-semibold text-white">
-                <CalendarDays className="text-indigo-400" size={20} />
-                Follow-up Meeting
-              </h3>
-              <p className="text-slate-300">
-                {result.followUp || "No follow-up meeting specified."}
-              </p>
-            </div>
-
-            <div className="flex flex-wrap gap-3">
-              <div className="flex flex-wrap items-end gap-2 rounded-xl border border-white/10 p-3">
-                <label className="text-xs text-slate-400">Send recap to
-                  <input value={recipient} onChange={e => setRecipient(e.target.value)} type="email" placeholder="name@example.com" className="mt-1 block rounded-lg border border-white/10 bg-[#080d19] px-3 py-2 text-sm text-white outline-none focus:border-indigo-500" />
-                </label>
-                <button onClick={sendRecap} disabled={emailLoading || !result.id} className="flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2 font-medium text-white hover:bg-indigo-500 disabled:opacity-50">
-                  {emailLoading ? <Loader2 size={17} className="animate-spin" /> : <Mail size={17} />}
-                  Send recap
-                </button>
-              </div>
-              <div className="flex flex-wrap items-end gap-2 rounded-xl border border-white/10 p-3">
-                <label className="text-xs text-slate-400">Follow-up starts
-                  <input value={calendarStart} onChange={e => setCalendarStart(e.target.value)} type="datetime-local" className="mt-1 block rounded-lg border border-white/10 bg-[#080d19] px-3 py-2 text-sm text-white outline-none focus:border-indigo-500" />
-                </label>
-                <label className="text-xs text-slate-400">Ends
-                  <input value={calendarEnd} onChange={e => setCalendarEnd(e.target.value)} type="datetime-local" className="mt-1 block rounded-lg border border-white/10 bg-[#080d19] px-3 py-2 text-sm text-white outline-none focus:border-indigo-500" />
-                </label>
-                <button onClick={scheduleFollowUp} disabled={calendarLoading || !result.id} className="flex items-center gap-2 rounded-xl border border-white/20 px-4 py-2 font-medium text-white hover:border-indigo-400 disabled:opacity-50">
-                  {calendarLoading ? <Loader2 size={17} className="animate-spin" /> : <CalendarDays size={17} />}
-                  Schedule
-                  <ArrowRight size={16} />
-                </button>
-              </div>
-            </div>
-            {automationMessage && <p role="status" className="mt-3 text-sm text-indigo-300">{automationMessage}</p>}
-          </div>
+              {meetingsLoading && !meetings.length ? (
+                <div role="status" className="mm-skeleton h-24 rounded-lg"><span className="sr-only">Loading meetings</span></div>
+              ) : historyError ? (
+                <Alert type="error">{historyError}</Alert>
+              ) : mine.length ? (
+                <Panel as="ul" className="divide-y divide-line">
+                  {mine.slice(0, 3).map((m) => (
+                    <li key={m.id}>
+                      <button type="button" onClick={() => openMeeting(m.id)} className="flex w-full flex-wrap items-baseline justify-between gap-x-6 gap-y-1 px-5 py-4 text-left hover:bg-paper-2/50">
+                        <span className="mm-display text-base font-semibold text-ink">{m.title}</span>
+                        <span className="text-xs text-mute">{formatDateTime(m.createdAt)}</span>
+                      </button>
+                    </li>
+                  ))}
+                </Panel>
+              ) : (
+                <p className="text-sm text-mute">Meetings you analyze while signed in will appear here.</p>
+              )}
+            </section>
+          </>
         )}
+
+        {view === "report" && result && (
+          <MeetingReport meeting={result} integrations={integrations.data || {}} onEditTranscript={() => navigate("overview")} />
+        )}
+        {view === "report" && !result && (
+          <Panel className="px-6 py-14 text-center">
+            <h1 className="mm-display text-xl font-semibold">No meeting open</h1>
+            <p className="mt-2 text-sm text-ink-2">Pick a meeting from your history or analyze a new transcript.</p>
+            <Button variant="primary" onClick={() => navigate("meetings")} className="mt-5">Go to meetings</Button>
+          </Panel>
+        )}
+
+        {view === "meetings" && (
+          <HistoryView {...listProps} onRetry={retryMeetings} onOpen={openMeeting} onDelete={deleteMeeting} onNewMeeting={() => navigate("overview")} />
+        )}
+        {view === "actions" && <ActionItemsView {...listProps} onOpen={openMeeting} onNewMeeting={() => navigate("overview")} />}
+        {view === "integrations" && <IntegrationsView integrations={integrations} onRefresh={refreshIntegrations} />}
+        {view === "profile" && <ProfileView user={user} onUserChange={onUserChange} onLogout={onLogout} meetingCount={mine.length} />}
       </main>
     </div>
   );
+}
+
+export default function App() {
+  const [user, setUser] = useState(() => getSessionUser());
+
+  function logout() {
+    signOut();
+    setUser(null);
+  }
+
+  if (!user) return <AuthScreen onAuthenticated={setUser} />;
+  return <Workspace key={user.id} user={user} onUserChange={setUser} onLogout={logout} />;
 }
